@@ -57,6 +57,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+import threading
 from typing import Any
 
 from agent.mcp.client import Inspection, MCPClientError, Session, ToolResult
@@ -96,6 +97,12 @@ class Toolbox:
         self.свои: set[str] = set()
         # Каталог конвейеров читается по требованию: без них он не нужен вовсе.
         self._конвейеры: Any = None
+        # Замок на открытие: страница умеет прислать два изменения настроек
+        # подряд (галочка «давать инструменты» и поле серверов), а Flask
+        # отвечает на них в разных потоках. Без замка «открыть» начиналось
+        # дважды, список инструментов собирался двумя половинами, и провайдер
+        # отвечал «Tool names must be unique» на весь запрос.
+        self._замок = threading.Lock()
 
     # --- подключение ----------------------------------------------------------
 
@@ -115,6 +122,13 @@ class Toolbox:
         """
         if self.открыт:
             return self.осмотры
+        with self._замок:
+            if self.открыт:      # пока ждали замок, соседний поток всё открыл
+                return self.осмотры
+            return self._открыть()
+
+    def _открыть(self) -> list[Inspection]:
+        """Сама работа: вызывается под замком, поэтому ровно один раз."""
         серверы = self.серверы()
         self.осмотры = []
         self.инструменты = []

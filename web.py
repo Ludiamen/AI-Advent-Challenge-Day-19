@@ -21,7 +21,7 @@ import os
 import threading
 import uuid
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, render_template, request
 
 from agent import AgentError, MemoryAgent
 from agent import catalog, interview, invariants as inv, preferences
@@ -37,6 +37,42 @@ log = logging.getLogger("web")
 
 app = Flask(__name__)
 agent = MemoryAgent()
+
+# --- демонстрационный стенд ---------------------------------------------------
+# Страница задумана как местная: 127.0.0.1, никакой защиты. Но показать её
+# бывает нужно тому, кто не сидит за этой машиной, — например браузерному
+# расширению, которое до локального адреса не достаёт, и тогда стенд выносят
+# наружу туннелем. Открытый наружу стенд — это чужой доступ к ключам провайдера
+# и к чужим системам агента, поэтому появляется общий секрет: переменная
+# DEMO_KEY. Пока её нет, всё работает как раньше и ни одной проверки не
+# добавляется.
+#
+# Секрет спрашивается один раз: адрес со «?key=…» ставит куку, дальше страница
+# и её запросы идут как обычно. Имя параметра и куки латиницей намеренно — это
+# не поле формы, а часть адреса и заголовка.
+ДЕМО_КЛЮЧ = os.getenv("DEMO_KEY", "").strip()
+ДЕМО_КУКА = "demo"
+
+
+@app.before_request
+def _ворота_стенда():
+    if not ДЕМО_КЛЮЧ:
+        return None
+    if request.cookies.get(ДЕМО_КУКА) == ДЕМО_КЛЮЧ:
+        return None
+    if request.args.get("key", "") == ДЕМО_КЛЮЧ:
+        g.выдать_куку = True
+        return None
+    return jsonify({"error": "Стенд закрыт: откройте адрес с «?key=…»."}), 401
+
+
+@app.after_request
+def _запомнить_ключ(ответ):
+    if getattr(g, "выдать_куку", False):
+        # samesite=Lax: расширение открывает адрес переходом, и кука должна
+        # доехать; httponly — чтобы её не читал скрипт страницы.
+        ответ.set_cookie(ДЕМО_КУКА, ДЕМО_КЛЮЧ, httponly=True, samesite="Lax")
+    return ответ
 
 # Режим, которого у самого агента нет: запускать ли сценарий по триггеру. В
 # консоли это ключ «--без-сценариев», здесь — переключатель на странице.

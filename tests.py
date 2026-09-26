@@ -4233,6 +4233,25 @@ class ИнструментарийАгента(unittest.TestCase):
         self.assertEqual(сводка["меняющих"], 0)
         self.assertGreater(сводка["токенов"], 0)
 
+    def test_одновременное_подключение_не_дублирует_инструменты(self):
+        # Страница присылает два изменения настроек подряд (галочка «давать
+        # инструменты» и поле серверов), а Flask отвечает в разных потоках — и
+        # «открыть» начиналось дважды. Список инструментов собирался двумя
+        # половинами, а провайдер отвечал «Tool names must be unique» на весь
+        # запрос. Нашлось живым показом в браузере.
+        ящик = amcp.Toolbox(["agent-state"], self.файл)
+        try:
+            потоки = [_threading.Thread(target=ящик.открыть) for _ in range(4)]
+            for поток in потоки:
+                поток.start()
+            for поток in потоки:
+                поток.join()
+            имена = [и["function"]["name"] for и in ящик.для_модели()]
+            self.assertEqual(len(имена), len(set(имена)), имена)
+            self.assertEqual(set(имена), {f"agent-state__{и}" for и in ИНСТРУМЕНТЫ_СВОЕГО})
+        finally:
+            ящик.close()
+
     def test_вызов_по_полному_имени(self):
         with amcp.Toolbox(["agent-state"], self.файл) as ящик:
             итог = ящик.вызвать("agent-state__list_tasks", {})
@@ -7107,11 +7126,163 @@ class ВебКонвейеров(unittest.TestCase):
         self.assertIn("pipelines", состояние)
         self.assertIn("конвейеры", состояние["pipelines"])
 
+    def test_аргументы_заявки_видны_целиком(self):
+        # Заявка на запуск цепочки несёт объект «input» — вход конвейера. String()
+        # печатал его как «[object Object]», и человек, которого спрашивают,
+        # не видел ни задачи, ни темы. Нашлось прогоном показа в браузере.
+        html = self.клиент.get("/").get_data(as_text=True)
+        self.assertIn("typeof зн === 'string' ? зн : JSON.stringify(зн)", html)
+        self.assertNotIn("экранировать(String(зн))", html)
+
+    def test_стенд_без_ключа_закрыт(self):
+        # DEMO_KEY включает ворота: стенд, вынесенный наружу туннелем (чтобы его
+        # увидело браузерное расширение), иначе отдал бы ключи провайдера и
+        # чужие системы агента всему интернету. Без переменной поведение
+        # прежнее — это проверяют все остальные тесты веба.
+        import importlib
+        import web
+
+        прежний = os.environ.get("DEMO_KEY")
+        os.environ["DEMO_KEY"] = "проба-ключа"
+        закрытый = importlib.reload(web)
+        try:
+            self.assertEqual(закрытый.app.test_client().get("/").status_code, 401)
+            self.assertEqual(закрытый.app.test_client().get("/?key=чужой").status_code, 401)
+            self.assertEqual(закрытый.app.test_client().get("/api/pipelines").status_code, 401)
+            свой = закрытый.app.test_client()
+            self.assertEqual(свой.get("/?key=проба-ключа").status_code, 200)
+            # Ключ спрашивается один раз: дальше едет кука, и ручки страницы
+            # работают без «?key=» в каждом запросе.
+            self.assertEqual(свой.get("/api/pipelines").status_code, 200)
+        finally:
+            закрытый.agent.close()
+            if прежний is None:
+                os.environ.pop("DEMO_KEY", None)
+            else:
+                os.environ["DEMO_KEY"] = прежний
+            type(self).web = importlib.reload(web)
+            type(self).клиент = self.web.app.test_client()
+
     def test_страница_рисует_панель(self):
         html = self.клиент.get("/").get_data(as_text=True)
         self.assertIn('id="конвейеры-панель"', html)
         self.assertIn("pipelines.json", html)
         self.assertIn("Конвейеры", html)
+
+
+class ПоказВБраузере(unittest.TestCase):
+    """Набор для показа дня: сценарий расширению, стенд, запись и режим «показ».
+
+    Проверяется не поведение модели, а состоятельность набора: что сцены водителя
+    опираются на элементы, которые на странице действительно есть, что скрипты
+    запускаются и ссылаются друг на друга теми же ключами, которыми описаны, и
+    что запись по умолчанию берёт окно браузера, а не весь экран. Ошибка здесь
+    обнаруживается иначе только живым прогоном на пять минут.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        читать = lambda *части: pathlib.Path(
+            os.path.join(КОРЕНЬ_ДНЯ, *части)).read_text(encoding="utf-8")
+        cls.водитель = читать("browser.mjs")
+        cls.показ = cls.водитель.split("if (РЕЖИМ === 'показ')")[1].split(
+            "if (РЕЖИМ === 'конвейер')")[0]
+        cls.страница = читать("templates", "index.html")
+        cls.сценарий = читать("DEMO-CHROME.md")
+        cls.стенд = читать("demo_stand.sh")
+        cls.запись = читать("record_demo.sh")
+        cls.показать = читать("demo_show.sh")
+
+    def test_шесть_сцен_с_подписями(self):
+        for номер in range(1, 7):
+            self.assertIn(f"Сцена {номер}", self.показ)
+        self.assertIn("подпись-показа", self.показ)
+        self.assertIn("process.env.PAUSE", self.показ)      # темп задаётся снаружи
+        self.assertIn("process.exit(0)", self.показ)        # показ не проверка
+
+    def test_сцены_опираются_на_настоящие_элементы_страницы(self):
+        # Самая дорогая ошибка показа — опечатка в идентификаторе: водитель
+        # молча ничего не нажимает, а видно это только на пятой минуте прогона.
+        for узел in ("конвейеры-панель", "конвейер-имя", "конвейер-вход", "конвейер-пуск",
+                     "заявки-панель", "инструменты-вкл", "инструменты-серверы",
+                     "инструменты-итог", "ввод", "отправить", "модель", "чат",
+                     "забыть"):
+            self.assertIn(узел, self.показ, f"сцены не пользуются «{узел}»")
+            self.assertIn(f'id="{узел}"', self.страница, f"на странице нет «{узел}»")
+        for класс in (".заявка-да",):
+            self.assertIn(класс, self.показ)
+            self.assertIn(класс.lstrip("."), self.страница)
+
+    def test_показ_не_нажимает_отклонить(self):
+        # «Отклонить» спрашивает причину через prompt(), а модальный диалог
+        # остановил бы и показ, и запись: водитель ждёт ответа страницы.
+        self.assertNotIn("заявка-нет", self.показ)
+        self.assertIn("prompt()", self.показ)               # и об этом сказано в коде
+
+    def test_сцены_проверяют_пункты_задания(self):
+        # Каждая сцена что-то утверждает: без утверждений показ был бы просто
+        # записью экрана, по которой непонятно, сошлось ли с ожиданием.
+        for признак in ("получил вход.запрос",              # вход цепочки доехал
+                        "получил находки.данные.находки",   # данные между шагами
+                        "выжимка.данные.текст",             # до шага сохранения
+                        "tracker__list_issues", "pipeline__save_to_file",
+                        "run_pipeline",                     # один вызов вместо четырёх
+                        "2/3"):                             # сбой остановил цепочку
+            self.assertIn(признак, self.показ, f"сцены не проверяют «{признак}»")
+        self.assertIn("РАСХОЖДЕНИЯ", self.показ)
+
+    def test_сценарий_расширению_описывает_те_же_сцены(self):
+        for номер in range(1, 7):
+            self.assertIn(f"Сцена {номер}", self.сценарий)
+        for цепочка in ("отчёт", "память", "в-трекер"):
+            self.assertIn(цепочка, self.сценарий)
+        for команда in ("bash demo_stand.sh", "bash record_demo.sh", "bash demo_show.sh"):
+            self.assertIn(команда, self.сценарий)
+        self.assertIn("MIG-999", self.сценарий)             # сцена сбоя
+        self.assertIn("5001", self.сценарий)                # порт 5000 — не наш
+
+    def test_скрипты_запускаются_и_согласованы(self):
+        for имя in ("demo_stand.sh", "record_demo.sh", "demo_show.sh"):
+            путь = os.path.join(КОРЕНЬ_ДНЯ, имя)
+            self.assertTrue(os.access(путь, os.X_OK), f"{имя} не исполняемый")
+            готово = _subprocess.run(["bash", "-n", путь], capture_output=True, text=True)
+            self.assertEqual(готово.returncode, 0, готово.stderr)
+            справка = _subprocess.run(["bash", путь, "--help"],
+                                      capture_output=True, text=True, timeout=60)
+            self.assertEqual(справка.returncode, 0, справка.stderr)
+            self.assertIn("Запуск:", справка.stdout)
+            self.assertNotIn("set -u", справка.stdout, f"справка {имя} задевает код")
+        # Стенд не занимает порт человека и закрывается секретом.
+        self.assertIn("PORT=5001", self.стенд)
+        self.assertIn("DEMO_KEY", self.стенд)
+        self.assertIn("--tunnel", self.стенд)
+        # Показ пишет именно то окно, которое сам открыл.
+        self.assertIn("record_demo.sh\" --name показ --pid", self.показать)
+        self.assertIn("browser.mjs", self.показать)
+        self.assertIn("показ", self.показать)
+
+    def test_запись_берёт_окно_а_не_экран(self):
+        # В кадре должно быть только окно браузера: рабочий стол и окно редактора
+        # к работе агента не относятся.
+        self.assertIn("_NET_CLIENT_LIST", self.запись)      # ищем окно у X
+        # Вокруг окна Chrome лежит прозрачная тень: в геометрии X она есть, на
+        # экране её нет. Без поправки по краям кадра видна полоска рабочего
+        # стола — нашлось разбором первого кадра записи.
+        self.assertIn("_GTK_FRAME_EXTENTS", self.запись)
+        self.assertIn("--pid", self.запись)
+        self.assertIn("--screen", self.запись)              # весь экран — только явно
+        self.assertIn("% 2", self.запись)                   # чётные размеры для yuv420p
+        self.assertNotIn('AREA=""\nSIZE="$(xrandr', self.запись)
+        # Область по умолчанию — окно, а не экран.
+        self.assertIn('WINDOW="Google Chrome"', self.запись)
+        # Незакрытый mp4 уже случался: ffmpeg должен получать именно INT.
+        self.assertIn('kill -INT "$FF"', self.запись)
+
+    def test_записи_не_попадают_в_репозиторий(self):
+        игнор = pathlib.Path(os.path.join(КОРЕНЬ_ДНЯ, ".gitignore")).read_text(
+            encoding="utf-8")
+        for правило in ("/demo/", "/demo-memory/", "/demo-reports/"):
+            self.assertIn(правило, игнор)
 
 
 # --- живые проверки -----------------------------------------------------------
