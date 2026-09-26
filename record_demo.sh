@@ -64,7 +64,6 @@ fi
 # есть всегда, где есть X. Размеры округляются до чётных: libx264 с yuv420p
 # нечётную ширину или высоту не принимает.
 window_area() {   # печатает WxH+X+Y окна браузера
-
   "$PY" - "${PID:-}" "${WINDOW:-}" <<'PYCODE'
 import re
 import subprocess
